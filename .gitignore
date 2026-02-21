@@ -1,0 +1,19 @@
+# OS/IDE
+.DS_Store
+.vscode/
+
+# Secrets / local env
+.env
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Airflow runtime artifacts
+airflow_home/logs/
+airflow_home/airflow.db
+airflow_home/simple_auth_manager_passwords.json.generated
+
+# Local DB artifacts
+*.db

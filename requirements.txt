@@ -1,0 +1,6 @@
+apache-airflow==2.10.5
+requests
+feedparser
+python-dotenv
+openai
+tweepy
