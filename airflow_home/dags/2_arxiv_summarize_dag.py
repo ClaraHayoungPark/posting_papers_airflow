@@ -1,93 +1,184 @@
-from datetime import datetime          # DAG 시작 날짜 설정용
-import sqlite3                         # SQLite DB 접근
-import os                              # 환경변수 읽기
+from datetime import datetime
+import logging
+import os
+import sqlite3
+import time
 
-from airflow import DAG                # Airflow DAG 정의
-from airflow.operators.python import PythonOperator  # Python 함수 실행용 Operator
+from airflow import DAG
+from airflow.operators.python import PythonOperator, ShortCircuitOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from dotenv import load_dotenv
 
-from dotenv import load_dotenv         # .env 파일 로드
+load_dotenv()
+logger = logging.getLogger(__name__)
 
-load_dotenv()                          # .env의 환경변수를 현재 환경에 적용
+DB_PATH = "/Users/hayoung/airflow-local/arxiv_pipeline.db"
+BATCH_SIZE = max(1, int(os.getenv("ARXIV_SUMMARY_BATCH_SIZE", "5")))
+OPENAI_TIMEOUT = float(os.getenv("ARXIV_SUMMARY_OPENAI_TIMEOUT", "120"))
+OPENAI_MAX_RETRIES = max(0, int(os.getenv("ARXIV_SUMMARY_OPENAI_RETRIES", "2")))
+PER_PAPER_RETRY = max(1, int(os.getenv("ARXIV_SUMMARY_PER_PAPER_RETRY", "2")))
+SUMMARY_MAX_CHARS = 240
 
-DB_PATH = "/Users/hayoung/airflow-local/arxiv_pipeline.db"   # SQLite DB 경로
+SELECT_UNSUMMARIZED_BATCH = """
+    SELECT p.arxiv_id, p.title, p.abstract
+    FROM papers p
+    LEFT JOIN summaries s ON s.arxiv_id = p.arxiv_id
+    WHERE s.arxiv_id IS NULL
+    ORDER BY p.fetched_at DESC
+    LIMIT ?
+"""
+
+COUNT_UNSUMMARIZED = """
+    SELECT COUNT(*)
+    FROM papers p
+    LEFT JOIN summaries s ON s.arxiv_id = p.arxiv_id
+    WHERE s.arxiv_id IS NULL
+"""
+
+INSERT_SUMMARY = """
+    INSERT OR IGNORE INTO summaries (arxiv_id, summary_500, model)
+    VALUES (?, ?, ?)
+"""
 
 
-def summarize_text_openai(title: str, abstract: str):
-    # DAG 파싱 시 import 에러를 피하기 위해 실행 시점에만 import
+def get_openai_client():
     from openai import OpenAI
 
-    # OpenAI API 키 확인
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is missing.")
 
-    # OpenAI 클라이언트 생성
-    client = OpenAI(api_key=api_key)
+    return OpenAI(
+        api_key=api_key,
+        timeout=OPENAI_TIMEOUT,
+        max_retries=OPENAI_MAX_RETRIES,
+    )
 
-    # 요약 요청 프롬프트
+
+def summarize_text_openai(client, title: str, abstract: str):
     prompt = f"""
-Summarize the following abstract in English in about 500 characters (±50).
-One paragraph. Include problem, method, and results.
+Summarize the following abstract in English.
+Hard limit: 240 characters maximum (including spaces and punctuation).
+If your draft is longer than 240 characters, rewrite it until it is 240 or fewer.
+One paragraph. Include problem, method, and key findings/evidence.
 Do not add new information. Output only the summary.
 
 Title: {title}
 Abstract: {abstract}
 """.strip()
 
-    # OpenAI API 호출
-    resp = client.responses.create(
-        model="gpt-5-mini",
-        input=prompt,
+    resp = client.responses.create(model="gpt-5-mini", input=prompt)
+    summary = " ".join(resp.output_text.strip().split())
+    if len(summary) > SUMMARY_MAX_CHARS:
+        summary = summary[: SUMMARY_MAX_CHARS - 3].rstrip() + "..."
+    return summary, getattr(resp, "model", "unknown")
+
+
+def summarize_candidates():
+    client = get_openai_client()
+
+    with sqlite3.connect(DB_PATH, timeout=60) as conn:
+        cur = conn.cursor()
+        cur.execute(SELECT_UNSUMMARIZED_BATCH, (BATCH_SIZE,))
+        rows = cur.fetchall()
+        logger.info("[summarize] candidates=%d (batch_size=%d)", len(rows), BATCH_SIZE)
+
+        success_count = 0
+        fail_count = 0
+
+        for idx, (arxiv_id, title, abstract) in enumerate(rows, start=1):
+            logger.info("[summarize] %d/%d arxiv_id=%s", idx, len(rows), arxiv_id)
+
+            # 논문별 transient 오류를 흡수하기 위한 짧은 재시도 루프
+            summary = model = None
+            last_err = None
+            for attempt in range(1, PER_PAPER_RETRY + 1):
+                try:
+                    summary, model = summarize_text_openai(client, title, abstract)
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    logger.warning(
+                        "[summarize] retry=%d/%d arxiv_id=%s error=%s: %s",
+                        attempt,
+                        PER_PAPER_RETRY,
+                        arxiv_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    if attempt < PER_PAPER_RETRY:
+                        time.sleep(attempt)
+
+            if summary is None or model is None:
+                fail_count += 1
+                logger.warning(
+                    "[summarize] skip arxiv_id=%s after retries error=%s: %s",
+                    arxiv_id,
+                    type(last_err).__name__,
+                    last_err,
+                )
+                continue
+
+            cur.execute(INSERT_SUMMARY, (arxiv_id, summary, model))
+            success_count += 1
+
+        logger.info(
+            "[summarize] done success=%d failed=%d batch=%d",
+            success_count,
+            fail_count,
+            len(rows),
+        )
+        return {
+            "success": success_count,
+            "failed": fail_count,
+            "attempted": len(rows),
+        }
+
+
+def should_trigger_next_batch(ti):
+    result = ti.xcom_pull(task_ids="summarize_candidates") or {}
+    success = int(result.get("success", 0) or 0)
+    failed = int(result.get("failed", 0) or 0)
+    attempted = int(result.get("attempted", 0) or 0)
+
+    with sqlite3.connect(DB_PATH, timeout=60) as conn:
+        cur = conn.cursor()
+        cur.execute(COUNT_UNSUMMARIZED)
+        remaining = cur.fetchone()[0]
+
+    logger.info(
+        "[summarize] attempted=%d success=%d failed=%d remaining=%d",
+        attempted,
+        success,
+        failed,
+        remaining,
     )
-
-    # 모델이 생성한 텍스트 요약 추출
-    summary = resp.output_text.strip()
-
-    # 사용된 모델명 기록(없으면 unknown)
-    model = getattr(resp, "model", "unknown")
-
-    return summary, model
+    # 이번 배치에서 1건이라도 시도했다면 다음 배치로 계속 진행
+    return remaining > 0 and attempted > 0
 
 
-def summarize_latest_5():
-    # SQLite DB 연결
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    # 아직 요약되지 않은 최신 논문 5개 조회
-    cur.execute("""
-        SELECT p.arxiv_id, p.title, p.abstract
-        FROM papers p
-        LEFT JOIN summaries s ON s.arxiv_id = p.arxiv_id
-        WHERE s.arxiv_id IS NULL
-        ORDER BY p.fetched_at DESC
-        LIMIT 5
-    """)
-    rows = cur.fetchall()
-
-    # 각 논문에 대해 요약 생성 후 저장
-    for arxiv_id, title, abstract in rows:
-        summary, model = summarize_text_openai(title, abstract)
-
-        cur.execute("""
-            INSERT OR IGNORE INTO summaries (arxiv_id, summary_500, model)
-            VALUES (?, ?, ?)
-        """, (arxiv_id, summary, model))
-
-    # DB 반영 및 연결 종료
-    conn.commit()
-    conn.close()
-
-
-# Airflow DAG 정의
 with DAG(
-    dag_id="arxiv_summarize_pipeline",   
-    start_date=datetime(2026, 1, 1),    
-    schedule="@daily",                   
-    catchup=False,                       # 과거 실행분 자동 실행 안 함
+    dag_id="arxiv_summarize_pipeline",
+    start_date=datetime(2026, 1, 1),
+    schedule=None,
+    catchup=False,
+    max_active_runs=1,
 ) as dag:
 
     summarize = PythonOperator(
-        task_id="summarize_latest_5",
-        python_callable=summarize_latest_5,
+        task_id="summarize_candidates",
+        python_callable=summarize_candidates,
     )
+
+    check_more = ShortCircuitOperator(
+        task_id="check_more_candidates",
+        python_callable=should_trigger_next_batch,
+    )
+
+    trigger_next = TriggerDagRunOperator(
+        task_id="trigger_next_batch",
+        trigger_dag_id="arxiv_summarize_pipeline",
+        wait_for_completion=False,
+    )
+
+    summarize >> check_more >> trigger_next
