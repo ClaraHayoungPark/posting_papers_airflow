@@ -4,3 +4,5 @@ feedparser
 python-dotenv
 openai
 tweepy
+
+requests-oauthlib
