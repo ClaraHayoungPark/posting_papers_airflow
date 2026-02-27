@@ -6,30 +6,43 @@ import sqlite3
 import requests
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from dotenv import load_dotenv
 from requests_oauthlib import OAuth1
 
-load_dotenv()
+from arxiv_common import ensure_pipeline_support_tables, get_db_path
+
 logger = logging.getLogger(__name__)
 
-DB_PATH = "/Users/hayoung/airflow-local/arxiv_pipeline.db"
+DB_PATH = get_db_path()
 POST_SCORE = 5
 X_POST_URL = "https://api.twitter.com/2/tweets"
-
-CONSUMER_KEY = os.environ.get("CONSUMER_KEY")
-CONSUMER_SECRET = os.environ.get("CONSUMER_SECRET")
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
-ACCESS_TOKEN_SECRET = os.environ.get("ACCESS_TOKEN_SECRET")
 
 
 def build_tweet_text(summary: str, arxiv_id: str) -> str:
     return f"{summary}\nhttps://arxiv.org/abs/{arxiv_id}"
 
 
-def post_tweet(text: str):
+def get_x_credentials() -> dict[str, str]:
+    credentials = {
+        "CONSUMER_KEY": os.environ.get("CONSUMER_KEY", ""),
+        "CONSUMER_SECRET": os.environ.get("CONSUMER_SECRET", ""),
+        "ACCESS_TOKEN": os.environ.get("ACCESS_TOKEN", ""),
+        "ACCESS_TOKEN_SECRET": os.environ.get("ACCESS_TOKEN_SECRET", ""),
+    }
+    missing = [name for name, value in credentials.items() if not value]
+    if missing:
+        raise RuntimeError(f"Missing X credentials: {', '.join(missing)}")
+    return credentials
+
+
+def post_tweet(text: str, credentials: dict[str, str]):
     return requests.post(
         url=X_POST_URL,
-        auth=OAuth1(CONSUMER_KEY, CONSUMER_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET),
+        auth=OAuth1(
+            credentials["CONSUMER_KEY"],
+            credentials["CONSUMER_SECRET"],
+            credentials["ACCESS_TOKEN"],
+            credentials["ACCESS_TOKEN_SECRET"],
+        ),
         json={"text": text},
         headers={"Content-Type": "application/json"},
         timeout=30,
@@ -37,19 +50,8 @@ def post_tweet(text: str):
 
 
 def post_to_x():
-    # X 인증키 누락 시 즉시 실패
-    missing = [
-        name
-        for name, value in {
-            "CONSUMER_KEY": CONSUMER_KEY,
-            "CONSUMER_SECRET": CONSUMER_SECRET,
-            "ACCESS_TOKEN": ACCESS_TOKEN,
-            "ACCESS_TOKEN_SECRET": ACCESS_TOKEN_SECRET,
-        }.items()
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(f"Missing X credentials: {', '.join(missing)}")
+    ensure_pipeline_support_tables()
+    credentials = get_x_credentials()
 
     with sqlite3.connect(DB_PATH, timeout=60) as conn:
         cur = conn.cursor()
@@ -74,7 +76,7 @@ def post_to_x():
         posted_count = 0
         for idx, (arxiv_id, summary) in enumerate(rows, start=1):
             tweet_text = build_tweet_text(summary, arxiv_id)
-            response = post_tweet(tweet_text)
+            response = post_tweet(tweet_text, credentials)
 
             # 성공한 건만 posted 테이블에 기록
             if response.status_code == 201:

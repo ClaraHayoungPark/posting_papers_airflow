@@ -2,16 +2,18 @@ from datetime import datetime
 import logging
 import re
 import sqlite3
-import requests
+
 import feedparser
+import requests
 from airflow import DAG
 from airflow.operators.python import PythonOperator, get_current_context
 
-# SQLite DB 파일 경로
-DB_PATH = "/Users/hayoung/airflow-local/arxiv_pipeline.db"
+from arxiv_common import ensure_pipeline_support_tables, get_db_path
+
+DB_PATH = get_db_path()
 
 # arXiv Atom API 엔드포인트
-ARXIV_URL = "http://export.arxiv.org/api/query"
+ARXIV_URL = "https://export.arxiv.org/api/query"
 logger = logging.getLogger(__name__)
 
 EXCLUDED_KEYWORDS = [
@@ -137,6 +139,7 @@ def fetch_arxiv_papers(max_papers=100):
 def store_papers_to_sqlite():
     """fetch 결과를 XCom에서 받아 papers 테이블에 저장한다."""
 
+    ensure_pipeline_support_tables()
     ti = get_current_context()["ti"]
     fetch_result = ti.xcom_pull(task_ids="fetch_arxiv") or {}
     if isinstance(fetch_result, dict) and "rows" in fetch_result:
@@ -169,16 +172,14 @@ def store_papers_to_sqlite():
             "ignored_duplicates": 0,
         }
 
-    conn = sqlite3.connect(DB_PATH)
-    before_changes = conn.total_changes
-    conn.executemany(
-        "INSERT OR IGNORE INTO papers VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
-        rows,
-    )
-    inserted_count = conn.total_changes - before_changes
-    ignored_count = fetched_count - inserted_count
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH, timeout=60) as conn:
+        before_changes = conn.total_changes
+        conn.executemany(
+            "INSERT OR IGNORE INTO papers VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
+            rows,
+        )
+        inserted_count = conn.total_changes - before_changes
+        ignored_count = fetched_count - inserted_count
 
     logger.info(
         (
