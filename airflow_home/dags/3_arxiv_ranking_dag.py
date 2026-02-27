@@ -7,21 +7,36 @@ from datetime import datetime
 from airflow import DAG
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from dotenv import load_dotenv
 
-load_dotenv()
+from arxiv_common import (
+    ensure_pipeline_support_tables,
+    get_db_path,
+    get_env_float,
+    get_env_int,
+)
+
 logger = logging.getLogger(__name__)
 
-DB_PATH = "/Users/hayoung/airflow-local/arxiv_pipeline.db"
-RANKING_BATCH_SIZE = max(1, int(os.getenv("ARXIV_RANKING_BATCH_SIZE", 5)))
+DB_PATH = get_db_path()
+RANKING_BATCH_SIZE = get_env_int("ARXIV_RANKING_BATCH_SIZE", 5, minimum=1)
+RANKING_OPENAI_TIMEOUT = get_env_float(
+    "ARXIV_RANKING_OPENAI_TIMEOUT", 120.0, minimum=1.0
+)
+RANKING_OPENAI_RETRIES = get_env_int("ARXIV_RANKING_OPENAI_RETRIES", 2, minimum=0)
+RANKING_MAX_FAILURES = get_env_int("ARXIV_RANKING_MAX_FAILURES", 3, minimum=1)
+RANKING_STAGE = "ranking"
 
 SELECT_UNRANKED_BATCH = """
 SELECT p.arxiv_id, p.title, s.summary_500
 FROM papers p
 JOIN summaries s ON s.arxiv_id = p.arxiv_id
 LEFT JOIN rankings r ON r.arxiv_id = p.arxiv_id
+LEFT JOIN processing_failures f
+  ON f.arxiv_id = p.arxiv_id
+ AND f.stage = ?
 WHERE r.arxiv_id IS NULL
-ORDER BY p.fetched_at DESC
+  AND COALESCE(f.failure_count, 0) < ?
+ORDER BY COALESCE(f.failure_count, 0) ASC, p.fetched_at DESC
 LIMIT ?
 """
 
@@ -30,7 +45,11 @@ SELECT COUNT(*)
 FROM papers p
 JOIN summaries s ON s.arxiv_id = p.arxiv_id
 LEFT JOIN rankings r ON r.arxiv_id = p.arxiv_id
+LEFT JOIN processing_failures f
+  ON f.arxiv_id = p.arxiv_id
+ AND f.stage = ?
 WHERE r.arxiv_id IS NULL
+  AND COALESCE(f.failure_count, 0) < ?
 """
 
 UPSERT_RANKING = """
@@ -38,15 +57,42 @@ INSERT OR REPLACE INTO rankings (arxiv_id, score, ranked_at)
 VALUES (?, ?, datetime('now'))
 """
 
+UPSERT_FAILURE = """
+INSERT INTO processing_failures (
+    stage,
+    arxiv_id,
+    failure_count,
+    last_error,
+    last_failed_at
+)
+VALUES (?, ?, 1, ?, datetime('now'))
+ON CONFLICT(stage, arxiv_id) DO UPDATE SET
+    failure_count = processing_failures.failure_count + 1,
+    last_error = excluded.last_error,
+    last_failed_at = excluded.last_failed_at
+"""
 
-def score_paper_openai(title: str, summary: str) -> int:
+DELETE_FAILURE = """
+DELETE FROM processing_failures
+WHERE stage = ? AND arxiv_id = ?
+"""
+
+
+def get_openai_client():
     from openai import OpenAI
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is missing.")
 
-    client = OpenAI(api_key=api_key)
+    return OpenAI(
+        api_key=api_key,
+        timeout=RANKING_OPENAI_TIMEOUT,
+        max_retries=RANKING_OPENAI_RETRIES,
+    )
+
+
+def score_paper_openai(client, title: str, summary: str) -> int:
     prompt = f"""
 You are scoring an AI research paper for long-term impact.
 
@@ -80,30 +126,61 @@ Summary: {summary}
 
 
 def rank_candidates():
+    ensure_pipeline_support_tables()
+    client = get_openai_client()
+
     with sqlite3.connect(DB_PATH, timeout=60) as conn:
         cur = conn.cursor()
-        cur.execute(SELECT_UNRANKED_BATCH, (RANKING_BATCH_SIZE,))
+        cur.execute(
+            SELECT_UNRANKED_BATCH,
+            (RANKING_STAGE, RANKING_MAX_FAILURES, RANKING_BATCH_SIZE),
+        )
         rows = cur.fetchall()
-        if not rows:
-            return 0
+    if not rows:
+        return {"success": 0, "failed": 0, "attempted": 0}
 
-        success_count = 0
-        for arxiv_id, title, summary in rows:
-            try:
-                score = score_paper_openai(title, summary)
-            except Exception as exc:
-                logger.warning("[ranking] skip %s: %s", arxiv_id, exc)
-                continue
-            cur.execute(UPSERT_RANKING, (arxiv_id, score))
-            success_count += 1
-        return success_count
+    success_rows = []
+    failed_rows = []
+    for arxiv_id, title, summary in rows:
+        try:
+            score = score_paper_openai(client, title, summary)
+        except Exception as exc:
+            logger.warning("[ranking] skip %s: %s", arxiv_id, exc)
+            failed_rows.append((RANKING_STAGE, arxiv_id, f"{type(exc).__name__}: {exc}"[:500]))
+            continue
+        success_rows.append((arxiv_id, score))
+
+    with sqlite3.connect(DB_PATH, timeout=60) as conn:
+        cur = conn.cursor()
+        if success_rows:
+            cur.executemany(UPSERT_RANKING, success_rows)
+            cur.executemany(
+                DELETE_FAILURE,
+                [(RANKING_STAGE, arxiv_id) for arxiv_id, _ in success_rows],
+            )
+        if failed_rows:
+            cur.executemany(UPSERT_FAILURE, failed_rows)
+
+    logger.info(
+        "[ranking] done success=%d failed=%d batch=%d",
+        len(success_rows),
+        len(failed_rows),
+        len(rows),
+    )
+    return {
+        "success": len(success_rows),
+        "failed": len(failed_rows),
+        "attempted": len(rows),
+    }
 
 
 def should_trigger_next_batch(ti):
-    processed = ti.xcom_pull(task_ids="rank_candidates") or 0
+    ensure_pipeline_support_tables()
+    result = ti.xcom_pull(task_ids="rank_candidates") or {}
+    processed = int(result.get("attempted", 0) or 0)
     with sqlite3.connect(DB_PATH, timeout=60) as conn:
         cur = conn.cursor()
-        cur.execute(COUNT_UNRANKED)
+        cur.execute(COUNT_UNRANKED, (RANKING_STAGE, RANKING_MAX_FAILURES))
         remaining = cur.fetchone()[0]
     return processed > 0 and remaining > 0
 
