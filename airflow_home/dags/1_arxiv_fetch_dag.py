@@ -1,76 +1,81 @@
 from datetime import datetime
 import logging
-import re
+import os
 import sqlite3
+from pathlib import Path
 
-import feedparser
 import requests
+import feedparser
 from airflow import DAG
 from airflow.operators.python import PythonOperator, get_current_context
 
-from arxiv_common import ensure_pipeline_support_tables, get_db_path
-
-DB_PATH = get_db_path()
-
-# arXiv Atom API 엔드포인트
-ARXIV_URL = "https://export.arxiv.org/api/query"
 logger = logging.getLogger(__name__)
+DEFAULT_DB_PATH = str(Path(__file__).resolve().parents[2] / "arxiv_pipeline.db")
+DB_PATH = None
+ARXIV_URL = "https://export.arxiv.org/api/query"
 
-EXCLUDED_KEYWORDS = [
-    "survey",
-    "benchmark",
-    "leaderboard",
-    "dataset",
-    "shared task",
-    "competition",
-]
-
-EXCLUDED_DOMAIN_KEYWORDS = [
-    "clinical",
-    "patient",
-    "hospital",
-    "radiology",
-    "ehr",
-    "genomics",
-    "molecule",
-    "drug discovery",
-]
-
-EXCLUDED_PATTERNS = [
-    re.compile(r"\b(only|purely|solely)\s+(benchmark|evaluation)\b", re.IGNORECASE),
-    re.compile(r"\bbenchmark\s+(study|analysis)\b", re.IGNORECASE),
-]
-
+EXCLUDED_KEYWORDS = ["survey", "benchmark", "dataset"]
 MIN_ABSTRACT_LENGTH = 400
 
 
-def should_include_entry(title: str, abstract: str):
-    """고정 규칙으로 논문 포함 여부를 판단한다."""
-    normalized_abstract = " ".join(abstract.replace("\n", " ").split())
-    searchable = f"{title} {normalized_abstract}".lower()
+def get_db_path() -> str:
+    return os.getenv("ARXIV_DB_PATH", DEFAULT_DB_PATH)
 
-    if len(normalized_abstract) < MIN_ABSTRACT_LENGTH:
-        return False, "short_abstract"
 
-    if any(keyword in searchable for keyword in EXCLUDED_KEYWORDS):
-        return False, "excluded_keyword"
+def ensure_pipeline_support_tables() -> None:
+    with sqlite3.connect(DB_PATH, timeout=60) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS papers (
+                arxiv_id   TEXT PRIMARY KEY,
+                title      TEXT,
+                authors    TEXT,
+                url        TEXT,
+                abstract   TEXT,
+                fetched_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summaries (
+                arxiv_id    TEXT PRIMARY KEY,
+                summary_500 TEXT NOT NULL,
+                model       TEXT,
+                created_at  TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (arxiv_id) REFERENCES papers(arxiv_id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rankings (
+                arxiv_id  TEXT PRIMARY KEY,
+                score     INTEGER NOT NULL CHECK(score BETWEEN 1 AND 5),
+                ranked_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (arxiv_id) REFERENCES papers(arxiv_id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS posted (
+                arxiv_id  TEXT PRIMARY KEY,
+                posted_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (arxiv_id) REFERENCES papers(arxiv_id)
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_papers_fetched_at ON papers(fetched_at DESC)"
+        )
 
-    if any(keyword in searchable for keyword in EXCLUDED_DOMAIN_KEYWORDS):
-        return False, "excluded_domain"
 
-    if any(pattern.search(searchable) for pattern in EXCLUDED_PATTERNS):
-        return False, "excluded_pattern"
-
-    return True, None
+DB_PATH = get_db_path()
 
 
 def fetch_arxiv_papers(max_papers=100):
-    """cs.AI / cs.CL / cs.LG 최신 논문 최대 N개를 조회한다."""
-
-    # XCom -> DB INSERT에 전달할 결과 버퍼
-    rows = []
-
-    # 최신 업데이트 기준으로 max_papers개만 단일 조회
     r = requests.get(
         ARXIV_URL,
         params={
@@ -84,121 +89,46 @@ def fetch_arxiv_papers(max_papers=100):
     )
     r.raise_for_status()
 
-    entries = feedparser.parse(r.text).entries
-    filtered_out = {
-        "short_abstract": 0,
-        "excluded_keyword": 0,
-        "excluded_domain": 0,
-        "excluded_pattern": 0,
-    }
-
-    for e in entries:
+    rows = []
+    for e in feedparser.parse(r.text).entries:
         title = e.title.strip()
-        abstract = e.summary.replace("\n", " ").strip()
-        include, reason = should_include_entry(title, abstract)
-        if not include:
-            filtered_out[reason] += 1
+        abstract = e.summary.replace("\n", " ").strip().lower()
+
+        if len(abstract) < MIN_ABSTRACT_LENGTH:
+            continue
+        if any(k in (title.lower() + " " + abstract) for k in EXCLUDED_KEYWORDS):
             continue
 
         rows.append(
             (
-                e.id.split("/")[-1],
-                title,
-                ", ".join(a.name for a in e.authors),
-                e.link,
-                abstract,
+                e.id.split("/")[-1],                 # arxiv_id
+                title,                               # title
+                ", ".join(a.name for a in e.authors),# authors
+                e.link,                              # url
+                e.summary.replace("\n", " ").strip() # abstract
             )
         )
 
-    logger.info(
-        (
-            "Fetched %d papers from arXiv (max_papers=%d). "
-            "kept=%d filtered_short=%d filtered_keyword=%d "
-            "filtered_domain=%d filtered_pattern=%d filtered_total=%d"
-        ),
-        len(entries),
-        max_papers,
-        len(rows),
-        filtered_out["short_abstract"],
-        filtered_out["excluded_keyword"],
-        filtered_out["excluded_domain"],
-        filtered_out["excluded_pattern"],
-        sum(filtered_out.values()),
-    )
-    return {
-        "rows": rows,
-        "stats": {
-            "fetched_from_api": len(entries),
-            "filtered_out": filtered_out,
-            "filtered_total": sum(filtered_out.values()),
-            "kept_after_filter": len(rows),
-        },
-    }
+    logger.info("Fetched=%d, kept=%d", len(feedparser.parse(r.text).entries), len(rows))
+    return rows
 
 
 def store_papers_to_sqlite():
-    """fetch 결과를 XCom에서 받아 papers 테이블에 저장한다."""
-
     ensure_pipeline_support_tables()
+
     ti = get_current_context()["ti"]
-    fetch_result = ti.xcom_pull(task_ids="fetch_arxiv") or {}
-    if isinstance(fetch_result, dict) and "rows" in fetch_result:
-        rows = fetch_result.get("rows") or []
-        fetch_stats = fetch_result.get("stats") or {}
-    else:
-        rows = fetch_result if isinstance(fetch_result, list) else []
-        fetch_stats = {}
-
-    fetched_count = len(rows)
-    fetched_from_api = int(fetch_stats.get("fetched_from_api", fetched_count))
-    filtered_total = int(fetch_stats.get("filtered_total", 0))
-
-    logger.info(
-        (
-            "Fetch/Filter summary: fetched_from_api=%d "
-            "filtered_out_by_rules=%d kept_after_filter=%d"
-        ),
-        fetched_from_api,
-        filtered_total,
-        fetched_count,
-    )
+    rows = ti.xcom_pull(task_ids="fetch_arxiv") or []
     if not rows:
-        logger.info("No papers to store.")
-        return {
-            "fetched_from_api": fetched_from_api,
-            "filtered_out_by_rules": filtered_total,
-            "kept_after_filter": 0,
-            "inserted": 0,
-            "ignored_duplicates": 0,
-        }
+        logger.info("No rows to store.")
+        return
 
     with sqlite3.connect(DB_PATH, timeout=60) as conn:
-        before_changes = conn.total_changes
         conn.executemany(
             "INSERT OR IGNORE INTO papers VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
             rows,
         )
-        inserted_count = conn.total_changes - before_changes
-        ignored_count = fetched_count - inserted_count
 
-    logger.info(
-        (
-            "SQLite store result: fetched_from_api=%d filtered_out_by_rules=%d "
-            "kept_after_filter=%d inserted=%d ignored_duplicates=%d"
-        ),
-        fetched_from_api,
-        filtered_total,
-        fetched_count,
-        inserted_count,
-        ignored_count,
-    )
-    return {
-        "fetched_from_api": fetched_from_api,
-        "filtered_out_by_rules": filtered_total,
-        "kept_after_filter": fetched_count,
-        "inserted": inserted_count,
-        "ignored_duplicates": ignored_count,
-    }
+    logger.info("Stored rows=%d (duplicates ignored)", len(rows))
 
 
 with DAG(
@@ -207,7 +137,6 @@ with DAG(
     schedule=None,
     catchup=False,
 ) as dag:
-
     fetch = PythonOperator(
         task_id="fetch_arxiv",
         python_callable=fetch_arxiv_papers,
