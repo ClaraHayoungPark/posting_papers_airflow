@@ -13,9 +13,9 @@ TRIGGER_KWARGS = {
 
 
 with DAG(
-    dag_id="arxiv_monday_orchestrator",
+    dag_id="arxiv_orchestrator",
     start_date=datetime(2026, 1, 1),
-    schedule="0 6 * * 1",  # Every Monday 06:00 (local scheduler timezone)
+    schedule=None,  
     catchup=False,
     max_active_runs=1,
 ) as dag:
