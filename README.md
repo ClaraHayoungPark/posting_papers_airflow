@@ -1,7 +1,7 @@
 # AI Paper Signal  
 **선별형 arXiv 논문 큐레이션 자동화 서비스**
 
-Service: https://x.com/PaperAi27274
+Service: https://x.com/PaperAi27274  
 Period: February 2026  
 
 
