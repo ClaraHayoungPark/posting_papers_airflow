@@ -1,11 +1,10 @@
-# AI Paper Signal 🤖📄
-**매일 쏟아지는 AI 논문 중, 진짜 읽을 만한 것만 골라 올려드립니다**
+# AI Paper Signal 📄
 
-👉 X(Twitter) 계정: https://x.com/PaperAi27274  
-📅 운영 시작: 2026년 2월
+X(Twitter) 계정: https://x.com/PaperAi27274  
+시작: 2026년 2월
 
 
-## 어떤 프로젝트인가요?
+## 개요
 
 매일 수백 편의 AI 논문이 arXiv라는 논문 사이트에 올라옵니다.  
 이 중에서 정말 가치 있는 논문을 사람이 일일이 읽고 고르는 건 사실상 불가능합니다.
@@ -23,7 +22,7 @@
 일정한 기준 이상인 것만 발행하는 **품질 필터링 자동화**가 핵심입니다.
 
 
-## 어떻게 동작하나요?
+## 동작
 
 ![Pipeline Architecture](project_flow_image.png)
 
@@ -55,23 +54,6 @@
 | AI 요약·평가 | OpenAI API (gpt-5-mini) |
 | 논문 수집 | arXiv API |
 | X 포스팅 | X(Twitter) API v2 |
-
-
-## 파일 구조
-
-```
-airflow-local/
-├── airflow_home/
-│   └── dags/
-│       ├── 0_orchestrator_dag.py   # 전체 파이프라인 실행 조율
-│       ├── 1_arxiv_fetch_dag.py    # 논문 수집
-│       ├── 2_arxiv_summarize_dag.py # AI 요약
-│       ├── 3_arxiv_ranking_dag.py  # AI 평가
-│       └── 4_arxiv_post_dag.py     # X 포스팅
-├── arxiv_pipeline.db               # 수집·요약·평가 결과 저장 DB
-└── requirements.txt                # 패키지 목록
-```
-
 
 ## 환경 변수 설정
 
